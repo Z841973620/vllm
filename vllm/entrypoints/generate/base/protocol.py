@@ -124,7 +124,8 @@ class PerRequestMetrics(OpenAIBaseModel):
     generation_time_ms: float | None = None
     queue_time_ms: float | None = None
     mean_itl_ms: float | None = None
-    tokens_per_second: float | None = None
+    prefill_tokens_per_second: float | None = None
+    decode_tokens_per_second: float | None = None
     # Experimental, subject to change.
     speculative_decoding: SpeculativeDecodingMetrics | None = None
 

@@ -907,7 +907,10 @@ class OpenAIServingResponses(GenerateBaseServing):
             and context.request_metrics_cover_all_generation_turns
         ):
             per_request_metrics = build_per_request_timing_metrics(
-                context.request_metrics, num_generated_tokens
+                context.request_metrics,
+                num_generated_tokens,
+                num_prompt_tokens,
+                num_cached_tokens,
             )
         response = ResponsesResponse.from_request(
             request,

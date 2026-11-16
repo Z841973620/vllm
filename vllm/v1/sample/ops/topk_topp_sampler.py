@@ -111,11 +111,11 @@ def flashinfer_sampler_supported() -> bool:
         num_sms := current_platform.num_compute_units(
             torch.accelerator.current_device_index()
         )
-    ) <= 16:
-        # FlashInfer 0.7+ rejects multi-CTA top-k masking on <=16 SMs because
-        # its cross-CTA software barrier cannot guarantee forward progress.
+    ) < 12:
+        # FlashInfer's multi-CTA top-k masking needs enough CTAs to make its
+        # cross-CTA software barrier's forward-progress assumption hold.
         unsupported_reason = (
-            f"top-k masking requires more than 16 SMs; device has {num_sms}"
+            f"top-k masking requires at least 12 SMs; device has {num_sms}"
         )
     else:
         unsupported_reason = _flashinfer_jit_unsupported_reason(capability)

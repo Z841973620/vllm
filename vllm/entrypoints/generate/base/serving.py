@@ -45,14 +45,20 @@ PRIORITY_HEADER = "X-Vllm-Priority"
 def build_per_request_timing_metrics(
     metrics: RequestStateStats | None,
     num_generation_tokens: int,
+    num_prompt_tokens: int | None = None,
+    num_cached_tokens: int | None = None,
 ) -> PerRequestMetrics:
     """Build per-request timing metrics from ``RequestStateStats``.
 
     ``generation_time_ms`` is the decode interval only (first output token to
     last output token); it excludes both queue wait and prefill/TTFT.
-    ``tokens_per_second`` is overall output throughput: all generated tokens
-    over the inference interval (scheduling to last output token), so it counts
-    the prefill/TTFT phase and is not simply the reciprocal of ``mean_itl_ms``.
+    ``prefill_tokens_per_second`` = (prompt tokens - cached tokens) /
+    (TTFT - queue wait): uncached prompt tokens over the scheduled-to-
+    first-token window. Cache-write tokens are not subtracted (they were
+    prefilled during this request).
+    ``decode_tokens_per_second`` = all generated tokens over the
+    generation interval (first output token to last output token); queue
+    wait and prefill/TTFT excluded.
     Each field is left ``None`` when the timestamps it depends on are
     unavailable.
     """
@@ -68,7 +74,6 @@ def build_per_request_timing_metrics(
     generation_time_ms: float | None = None
     queue_time_ms: float | None = None
     mean_itl_ms: float | None = None
-    tokens_per_second: float | None = None
 
     if scheduled_ts > 0 and first_token_ts > 0:
         time_to_first_token_ms = (first_token_ts - scheduled_ts) * 1000
@@ -83,17 +88,29 @@ def build_per_request_timing_metrics(
         decode_time = last_token_ts - first_token_ts
         mean_itl_ms = decode_time / (num_generation_tokens - 1) * 1000
 
-    if scheduled_ts > 0 and last_token_ts > 0:
-        inference_time_ms = (last_token_ts - scheduled_ts) * 1000
-        if inference_time_ms > 0:
-            tokens_per_second = num_generation_tokens / inference_time_ms * 1000
+    prefill_tokens_per_second: float | None = None
+    decode_tokens_per_second: float | None = None
+    if generation_time_ms is not None and generation_time_ms > 0:
+        decode_tokens_per_second = (
+            num_generation_tokens / generation_time_ms * 1000
+        )
+    # Prefill TPS = (input - cached) / (TTFT - queue).
+    # time_to_first_token_ms is measured from scheduled_ts, so queue wait
+    # is already excluded; cache-write tokens stay in the numerator.
+    if num_prompt_tokens and time_to_first_token_ms is not None:
+        uncached_prompt_tokens = num_prompt_tokens - (num_cached_tokens or 0)
+        if time_to_first_token_ms > 0 and uncached_prompt_tokens > 0:
+            prefill_tokens_per_second = (
+                uncached_prompt_tokens / time_to_first_token_ms * 1000
+            )
 
     return PerRequestMetrics(
         time_to_first_token_ms=time_to_first_token_ms,
         generation_time_ms=generation_time_ms,
         queue_time_ms=queue_time_ms,
         mean_itl_ms=mean_itl_ms,
-        tokens_per_second=tokens_per_second,
+        prefill_tokens_per_second=prefill_tokens_per_second,
+        decode_tokens_per_second=decode_tokens_per_second,
     )
 
 
