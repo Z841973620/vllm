@@ -35,6 +35,50 @@ endif()
     subprocess.run([_get_cmake_bin(), "-P", script], check=True)
 
 
+def test_arch_specific_mode_expands_family_arches(tmp_path: Path):
+    repo_root = Path(__file__).parents[1]
+    script = tmp_path / "test_arch_specific_cuda_archs.cmake"
+    script.write_text(
+        f"""
+cmake_minimum_required(VERSION 3.26)
+include("{repo_root / "cmake" / "utils.cmake"}")
+set(VLLM_USE_CUDA_ARCH_SPECIFIC ON)
+cuda_archs_loose_intersection(
+  actual
+  "9.0a;10.0f;10.7f;11.0f;12.0f"
+  "9.0a;10.0a;10.3a;11.0a;12.0a;12.1a")
+set(expected "9.0a;10.0a;10.3a;11.0a;12.0a;12.1a")
+if(NOT "${{actual}}" STREQUAL "${{expected}}")
+  message(FATAL_ERROR "Expected '${{expected}}', got '${{actual}}'")
+endif()
+"""
+    )
+
+    subprocess.run([_get_cmake_bin(), "-P", script], check=True)
+
+
+def test_arch_specific_mode_expands_ptx_to_exact_sass(tmp_path: Path):
+    repo_root = Path(__file__).parents[1]
+    script = tmp_path / "test_exact_sass_cuda_archs.cmake"
+    script.write_text(
+        f"""
+cmake_minimum_required(VERSION 3.26)
+include("{repo_root / "cmake" / "utils.cmake"}")
+set(VLLM_USE_CUDA_ARCH_SPECIFIC ON)
+cuda_archs_loose_intersection(
+  actual
+  "7.5;8.0+PTX"
+  "8.0;8.6;8.7;8.9;9.0a;10.0a;10.3a;11.0a;12.0a;12.1a")
+set(expected "8.0;8.6;8.7;8.9;9.0a;10.0a;10.3a;11.0a;12.0a;12.1a")
+if(NOT "${{actual}}" STREQUAL "${{expected}}")
+  message(FATAL_ERROR "Expected '${{expected}}', got '${{actual}}'")
+endif()
+"""
+    )
+
+    subprocess.run([_get_cmake_bin(), "-P", script], check=True)
+
+
 def test_extract_archs_prefers_sass_target_over_corrupted_virtual_arch(
     tmp_path: Path,
 ):

@@ -153,6 +153,13 @@ class BaseFrontendArgs:
     """If set to True, enable tracking server_load_metrics in the app state."""
     enable_force_include_usage: bool = False
     """If set to True, including usage on every request."""
+    enable_responses_store: bool = False
+    """If set to True, retain input and output messages for OpenAI ``/responses``
+    requests that opt in via the ``store`` field. Off by default because
+    stored responses are kept in memory only (not persisted to disk) and are
+    never evicted until the server terminates - enabling this can cause
+    unbounded memory growth. Equivalent to setting the environment variable
+    ``VLLM_ENABLE_RESPONSES_API_STORE=1``."""
     sse_keep_alive_interval: int = 0
     """Send an SSE keep-alive comment line every this many seconds when a
     `/v1/chat/completions` or `/v1/completions` streaming response is idle
@@ -547,6 +554,13 @@ def validate_parsed_serve_args(args: argparse.Namespace):
             "Error: --enable-per-request-metrics requires engine statistics "
             "logging; remove --disable-log-stats to enable per-request metrics."
         )
+
+    # --enable-responses-store maps onto the upstream env switch; envs are
+    # read lazily, so setting os.environ here reaches the responses serving.
+    if getattr(args, "enable_responses_store", False):
+        import os
+
+        os.environ["VLLM_ENABLE_RESPONSES_API_STORE"] = "1"
 
     if args.data_parallel_multi_port_external_lb:
         from vllm.entrypoints.launchers.dp_supervisor import (

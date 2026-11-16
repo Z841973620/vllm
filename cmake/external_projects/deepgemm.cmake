@@ -62,6 +62,10 @@ else()
   message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
 endif()
 
+vllm_apply_external_patch(
+  "${deepgemm_SOURCE_DIR}"
+  "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_sm110.patch")
+
 # DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100 (official upstream),
 # and 12.8+ for SM120 / SM12x. CUDA 13+ can use the family-specific SM12x
 # arch; CUDA 12.x builds the arch-specific SM120/SM121 variants.
@@ -77,6 +81,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     endif()
   else()
     list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0a")
+  endif()
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    list(APPEND DEEPGEMM_SUPPORT_ARCHS "11.0f")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0f")

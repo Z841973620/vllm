@@ -258,6 +258,12 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Bind host-file-gather tables once every checkpoint shard is loaded."""
+        bind = getattr(layer, "bind_file_shards", None)
+        if bind is not None:
+            bind()
+
     def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
         """Return the dtype of rows that a pinned-host lookup writes."""
         return layer.weight.dtype
@@ -452,6 +458,17 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         sentinel = torch.finfo(torch.float32).min
         if torch.any(layer.weight_scale_2 == sentinel):
             raise ValueError("NVFP4 PLE checkpoint is missing its global scale")
+
+        # Bind host-file-gather tables once every checkpoint shard is
+        # loaded (this method overrides the base-class hook).
+        bind = getattr(layer, "bind_file_shards", None)
+        if bind is not None:
+            bind()
+        # The gather kernel dereferences weight_scale_2 directly; make sure
+        # it lives on the GPU next to the staging buffer.
+        layer.weight_scale_2.data = layer.weight_scale_2.data.to(
+            device=layer._staging.device
+        ).contiguous()
 
     def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
         return layer.params_dtype

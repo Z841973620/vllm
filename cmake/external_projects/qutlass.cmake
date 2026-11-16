@@ -53,6 +53,10 @@ if(NOT qutlass_SOURCE_DIR)
 endif()
 message(STATUS "[QUTLASS] QuTLASS is available at ${qutlass_SOURCE_DIR}")
 
+# Qutlass uses the same tcgen05 path for SM100, SM101 (Thor's CUDA 12.x
+# designation), SM103, and SM110 (Thor's CUDA 13+ designation). Keep Thor in a
+# separate list so TARGET_CUDA_ARCH can use the toolkit-appropriate spelling
+# when it is the only requested tcgen05 target.
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
   cuda_archs_loose_intersection(QUTLASS_SM120_ARCHS "12.0f" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.4)
@@ -60,28 +64,49 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
   else()
     cuda_archs_loose_intersection(QUTLASS_SM100_ARCHS "10.0f" "${CUDA_ARCHS}")
   endif()
+  cuda_archs_loose_intersection(QUTLASS_THOR_ARCHS "11.0f" "${CUDA_ARCHS}")
 else()
   cuda_archs_loose_intersection(QUTLASS_SM120_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
   cuda_archs_loose_intersection(QUTLASS_SM100_ARCHS "10.0a;10.3a" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(QUTLASS_THOR_ARCHS "10.1a" "${CUDA_ARCHS}")
 endif()
 
+set(QUTLASS_TCGEN05_ARCHS ${QUTLASS_SM100_ARCHS} ${QUTLASS_THOR_ARCHS})
+list(REMOVE_DUPLICATES QUTLASS_TCGEN05_ARCHS)
+list(SORT QUTLASS_TCGEN05_ARCHS COMPARE NATURAL ORDER ASCENDING)
+
 # QUTLASS uses TARGET_CUDA_ARCH as a single preprocessor selector for all its
-# sources. Do not compile a mixed SM100/SM120 arch list with one selector; prefer
-# SM100 when both families are requested because that is the primary deployed
-# target for this extension today.
-if(QUTLASS_SM100_ARCHS)
-  set(QUTLASS_ARCHS "${QUTLASS_SM100_ARCHS}")
-  set(QUTLASS_TARGET_CC 100)
+# sources. Its SM100, SM101, and SM110 selectors enter the same tcgen05 source
+# branches, so those SASS targets can share one extension. Do not mix that path
+# with SM120, which selects different source branches.
+if(QUTLASS_TCGEN05_ARCHS)
+  set(QUTLASS_ARCHS "${QUTLASS_TCGEN05_ARCHS}")
+  if(QUTLASS_SM100_ARCHS)
+    # SM100 and SM103 already use this selector; it is source-equivalent to the
+    # SM101/SM110 selector in the pinned Qutlass revision.
+    set(QUTLASS_TARGET_CC 100)
+  elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    set(QUTLASS_TARGET_CC 110)
+  else()
+    set(QUTLASS_TARGET_CC 101)
+  endif()
   if(QUTLASS_SM120_ARCHS)
     message(WARNING
-      "[QUTLASS] Both SM100 and SM120 archs were requested; selecting SM100 "
-      "because TARGET_CUDA_ARCH is a single compile-time selector.")
+      "[QUTLASS] Both tcgen05 (SM100/SM103/SM110) and SM120 archs were "
+      "requested; selecting the tcgen05 path because TARGET_CUDA_ARCH is a "
+      "single compile-time selector.")
   endif()
 elseif(QUTLASS_SM120_ARCHS)
   set(QUTLASS_ARCHS "${QUTLASS_SM120_ARCHS}")
   set(QUTLASS_TARGET_CC 120)
 else()
   set(QUTLASS_ARCHS)
+endif()
+
+if(QUTLASS_ARCHS)
+  message(STATUS
+    "[QUTLASS] CUDA architectures: ${QUTLASS_ARCHS} "
+    "(TARGET_CUDA_ARCH=${QUTLASS_TARGET_CC})")
 endif()
 
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND QUTLASS_ARCHS)
@@ -157,8 +182,8 @@ else()
       "[QUTLASS] Skipping build: CUDA 12.8 or newer is required (found ${CMAKE_CUDA_COMPILER_VERSION}).")
   else()
     message(STATUS
-      "[QUTLASS] Skipping build: no supported arch (12.0f / 10.0f) found in "
-      "CUDA_ARCHS='${CUDA_ARCHS}'.")
+      "[QUTLASS] Skipping build: no supported arch (SM100/SM103/SM110/SM120) "
+      "found in CUDA_ARCHS='${CUDA_ARCHS}'.")
   endif()
   add_custom_target(_qutlass_C)
 endif()

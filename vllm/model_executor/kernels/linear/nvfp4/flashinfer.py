@@ -425,6 +425,26 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
         )
         padded_weight, _ = pad_nvfp4_weight_for_cutlass(layer.weight.data)
         layer.weight = torch.nn.Parameter(padded_weight, requires_grad=False)
+        # B12x dynamically quantizes activations to FP4. modelopt_mixed
+        # checkpoints whose FP8 group has input_activations set skip
+        # KNvfp4Act.process(), leaving the activation-scale-derived attrs
+        # unset on the shared experts' dense NVFP4 layers. Default them
+        # to identity so the kernel can still run (on-the-fly dynamic
+        # quantization uses the raw activation range).
+        if not hasattr(layer, "input_global_scale_inv"):
+            layer.input_global_scale_inv = torch.nn.Parameter(
+                torch.tensor(1.0, dtype=torch.float32,
+                             device=layer.weight.device),
+                requires_grad=False,
+            )
+        if not hasattr(layer, "alpha"):
+            wgs = getattr(layer, "weight_global_scale", None)
+            if wgs is not None:
+                alpha_val = (layer.input_global_scale_inv
+                             * wgs.to(layer.input_global_scale_inv.dtype))
+            else:
+                alpha_val = layer.input_global_scale_inv
+            layer.alpha = alpha_val
 
     def apply_weights(
         self,

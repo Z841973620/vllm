@@ -1,0 +1,13 @@
+diff --git a/csrc/api/common.h b/csrc/api/common.h
+index d369a77..ceac98a 100644
+--- a/csrc/api/common.h
++++ b/csrc/api/common.h
+@@ -52,5 +52,7 @@ struct Arch {
+
+     bool is_sm100f() const {
+-        return major == 10;
++        // SM110 uses the same tcgen05/TMEM kernel family as SM100/SM103.
++        // CUDA 13 compiles these kernels for the architecture-specific 110a target.
++        return major == 10 || major == 11;
+     }
+ };

@@ -4,7 +4,13 @@
 
 from collections.abc import Iterable
 
+import mmap
+import os
+import threading
+import weakref
+from dataclasses import dataclass
 import torch
+import triton
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
@@ -27,6 +33,9 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
+from ..common.ngram_embedding import (
+    _lookup_nvfp4_ple_embedding_kernel,
+)
 from ..common.ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
@@ -41,6 +50,319 @@ __all__ = [
     "Qwen4ExpPLEUnquantizedEmbeddingMethod",
     "Qwen4ExpNGramEmbedding",
 ]
+
+
+
+def _maps_entry(ptr: int) -> tuple[str, int]:
+    """Return the path and file offset of ``ptr`` from ``/proc/self/maps``."""
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            fields = line.split(maxsplit=5)
+            low, high = (int(bound, 16) for bound in fields[0].split("-"))
+            if low <= ptr < high:
+                path = fields[5].rstrip("\n") if len(fields) > 5 else ""
+                return path, ptr - low + int(fields[2], 16)
+    return "", 0
+
+
+class _PleShardEntry:
+    """Per-shard byte views for one PLE parameter."""
+
+    def __init__(self) -> None:
+        self.views: dict[str, torch.Tensor] = {}
+
+
+class Qwen4ExpPLEFileGatherEmbedding(Qwen4ExpPLEEmbedding):
+    """PLE rows read on the host from the checkpoint shard files.
+
+    Supports both single-parameter tables (BF16/FP8) and the NVFP4
+    two-parameter layout (weight uint8 + weight_scale float8). NVFP4 rows
+    are gathered packed and decoded on the GPU with the same Triton kernel
+    the resident path uses, so numerics match exactly.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+        reduce_results: bool = False,
+    ) -> None:
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            data_parallel_rank=data_parallel_rank,
+        )
+        self.reduce_results = reduce_results
+        self._dummy = (
+            get_current_vllm_config().load_config.load_format == "dummy"
+        )
+        shape = (max_total_tokens, num_ngram_heads, embedding_dim)
+        device = self.weight.device
+        self._nvfp4 = isinstance(self.embedding_method,
+                                 Qwen4ExpPLENvFp4EmbeddingMethod)
+        if self._nvfp4:
+            self._decode_dtype = self.params_dtype
+            self._param_names = ("weight", "weight_scale")
+            self._param_shapes = {
+                "weight": (
+                    max_total_tokens, num_ngram_heads,
+                    embedding_dim // 2,
+                ),
+                "weight_scale": (
+                    max_total_tokens, num_ngram_heads,
+                    embedding_dim // 16,
+                ),
+            }
+            self._param_dtypes = {
+                "weight": torch.uint8,
+                "weight_scale": torch.float8_e4m3fn,
+            }
+        else:
+            self._decode_dtype = self.weight.dtype
+            self._param_names = ("weight",)
+            self._param_shapes = {
+                "weight": (max_total_tokens, num_ngram_heads,
+                           embedding_dim),
+            }
+            self._param_dtypes = {"weight": self.weight.dtype}
+        self._staging = torch.zeros(shape, dtype=self._decode_dtype,
+                                    device=device)
+        self._row_ids: torch.Tensor | None = None
+        self._host_ids = torch.empty(
+            shape[:2], dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        # Step N+1 writes these rows only after its stream sync, so after
+        # step N's H2D copy. One host buffer per parameter, shaped to the
+        # parameter's real row width.
+        # Double-height pinned buffers: the top half is the gather window,
+        # the bottom half is the preadv scratch (source/dest of the
+        # index_select must not alias).
+        self._host_rows = {
+            name: torch.empty(self._param_shapes[name],
+                              dtype=self._param_dtypes[name],
+                              device="cpu", pin_memory=True)
+            for name in self._param_names
+        }
+        self._rows = {
+            name: tensor.flatten(0, 1).view(torch.uint8)
+            for name, tensor in self._host_rows.items()
+        }
+        self._shards: dict[int, dict[str, torch.Tensor]] | None = {}
+        self._shard_size = 0
+        self._bound = False
+        self._fds: dict[str, int] = {}
+        self._fds_t: dict[str, torch.Tensor] = {}
+        self._bases: dict[str, torch.Tensor] = {}
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Allocate no rows; they stay in the checkpoint files."""
+        return torch.empty(0, embedding_dim, dtype=dtype)
+
+    def accept_checkpoint_shard(
+        self,
+        shard_index: int,
+        loaded_weight: torch.Tensor,
+        shard_size: int,
+        param_name: str = "weight",
+    ) -> None:
+        """Keep a checkpoint shard as a zero-copy byte view of its storage."""
+        if self._bound or self._shards is None:
+            self._shards = None
+            raise RuntimeError(
+                "PLE host file gather does not support weight reload"
+            )
+        param = getattr(self, param_name)
+        if loaded_weight.dtype != param.dtype:
+            raise ValueError(
+                f"PLE shard dtype {loaded_weight.dtype} must match the "
+                f"parameter {param_name} dtype {param.dtype}; host file "
+                f"gather serves rows as stored"
+            )
+        entry = self._shards.setdefault(shard_index, {})
+        if param_name in entry:
+            raise ValueError(f"Duplicate PLE embedding shard {shard_index}")
+        entry[param_name] = loaded_weight.view(torch.uint8)
+        self._shard_size = shard_size
+
+    def bind_file_shards(self) -> None:
+        """Record each shard's file/offset and release the loader views."""
+        if self._shards is None:
+            raise RuntimeError(
+                "PLE host file gather does not support weight reload"
+            )
+        if not self._dummy and not self._bound:
+            for pname in self._param_names:
+                rows = sum(shard[pname].shape[0]
+                           for shard in self._shards.values())
+                if rows != self.org_vocab_size:
+                    raise ValueError(
+                        f"PLE shards cover {rows} of {self.org_vocab_size} "
+                        f"rows for {pname}"
+                    )
+            self._fds_t = {p: torch.zeros(len(self._shards)).long()
+                           for p in self._param_names}
+            self._bases = {p: torch.zeros(len(self._shards)).long()
+                           for p in self._param_names}
+            for index, shard in self._shards.items():
+                for pname in self._param_names:
+                    path, offset = _maps_entry(shard[pname].data_ptr())
+                    if not path or not os.path.isfile(path):
+                        raise ValueError(
+                            f"PLE embedding shard {index} {pname} is not a "
+                            f"file-backed view ({path or 'anonymous'})"
+                        )
+                    if path not in self._fds:
+                        self._fds[path] = os.open(path, os.O_RDONLY)
+                    self._fds_t[pname][index] = self._fds[path]
+                    self._bases[pname][index] = offset
+        self._shards = {}
+        self._bound = True
+
+    def _gather_rows(self, num_tokens: int, pname: str) -> None:
+        """Read one parameter's rows for ``_host_ids[:num_tokens]``."""
+        ids = self._host_ids[:num_tokens].flatten()
+        # _host_rows[pname] is 3-D (tokens, heads, width); flatten to the
+        # gather grid (tokens*heads, width). _rows[pname] is already the
+        # 2-D byte view of the WHOLE buffer — slicing it by num_tokens
+        # would be wrong when heads > 1, and re-flattening it here yields
+        # a 1-D tensor (IndexError on shape[1]).
+        out = self._host_rows[pname][:num_tokens].flatten(0, 1).view(
+            torch.uint8
+        )
+        if not self._fds:
+            out.zero_()
+            return
+        unique_ids, inverse = ids.unique(return_inverse=True)
+        if unique_ids.numel() and not (
+            0 <= unique_ids[0] <= unique_ids[-1] < self.org_vocab_size
+        ):
+            raise IndexError(
+                f"PLE id out of range for {self.org_vocab_size} rows"
+            )
+        shard = unique_ids // self._shard_size
+        local = unique_ids - shard * self._shard_size
+        page = mmap.PAGESIZE
+        row_bytes = out.shape[1]
+        start = self._bases[pname][shard] + local * row_bytes
+        first, last = start // page, (start + row_bytes - 1) // page
+        run = torch.ones_like(first, dtype=torch.bool)
+        run[1:] = (first[1:] > last[:-1] + 1) | (shard[1:] != shard[:-1])
+        fds, lows = (self._fds_t[pname][shard[run]].tolist(),
+                     first[run].tolist())
+        # Queue every page read before the serial reads.
+        for fd, lo, hi in zip(fds, lows, last[run.roll(-1)].tolist()):
+            os.posix_fadvise(
+                fd, lo * page, (hi - lo + 1) * page, os.POSIX_FADV_WILLNEED
+            )
+        # Read unique rows into a pageable scratch buffer (a few KiB per
+        # step: the gather working set is ~17 rows with no cross-step
+        # reuse), then expand into the pinned window. Scratch and window
+        # never alias, so index_select is legal; the GPU-side copy happens
+        # from the pinned staging buffer only.
+        scratch = torch.empty(
+            (unique_ids.numel(), row_bytes), dtype=torch.uint8
+        )
+        scratch_rows = scratch.numpy()
+        for row, fd, offset in zip(
+            scratch_rows, self._fds_t[pname][shard].tolist(),
+            start.tolist()
+        ):
+            if os.preadv(fd, [row], offset) != row_bytes:
+                raise ValueError(
+                    f"PLE shard file "
+                    f"{os.readlink(f'/proc/self/fd/{fd}')} is truncated "
+                    f"at offset {offset}"
+                )
+        torch.index_select(scratch, 0, inverse, out=out)
+
+    def stage_rows(self, num_tokens: int) -> None:
+        """Read the rows for ``_host_ids[:num_tokens]`` and stage them."""
+        if self._shards is None or not self._bound:
+            raise RuntimeError(
+                "PLE host file gather is unbound or was reloaded"
+            )
+        ids = self._host_ids[:num_tokens].flatten()
+        if self._nvfp4:
+            # Host gathers packed bytes + scales; the GPU decodes. The
+            # gathered rows are already in ``ids`` order, so the kernel's
+            # row id is the gather index (0..numel), NOT the global ngram
+            # id -- the gathered buffers only hold ``numel`` rows, and the
+            # ids themselves live on the CPU.
+            self._gather_rows(num_tokens, "weight")
+            self._gather_rows(num_tokens, "weight_scale")
+            packed = self._host_rows["weight"][:num_tokens].to(
+                device=self._staging.device, non_blocking=True
+            )
+            scales = self._host_rows["weight_scale"][:num_tokens].to(
+                device=self._staging.device, non_blocking=True
+            )
+            numel = ids.numel()
+            decoded = torch.empty(
+                (numel, self.embedding_dim),
+                dtype=self.params_dtype,
+                device=self._staging.device,
+            )
+            if numel:
+                if self._row_ids is None or self._row_ids.numel() < numel:
+                    self._row_ids = torch.arange(
+                        numel, device=self._staging.device,
+                        dtype=torch.int64,
+                    )
+                row_ids = self._row_ids[:numel]
+                _lookup_nvfp4_ple_embedding_kernel[(numel,)](
+                    packed.flatten(0, 1),
+                    scales.flatten(0, 1).view(torch.uint8),
+                    self.weight_scale_2,
+                    row_ids,
+                    decoded,
+                    self.embedding_dim,
+                    0,
+                    numel,
+                    BLOCK_D=triton.next_power_of_2(self.embedding_dim),
+                )
+            heads = self._host_ids.shape[1]
+            self._staging[:num_tokens] = decoded.reshape(
+                num_tokens, heads, self.embedding_dim
+            )
+        else:
+            self._gather_rows(num_tokens, "weight")
+            self._staging[:num_tokens].copy_(
+                self._host_rows["weight"][:num_tokens], non_blocking=True
+            )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the rows staged for this step."""
+        return self._staging[: hidden_states.shape[0]].flatten(-2)
+
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Rows are staged in ``prepare_inputs``, so prefetch is a no-op."""
+        return None
+
+    def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:
+        """Rows are staged on-device in ``prepare_inputs``/``stage_rows``;
+        forward reads the staging buffer directly."""
+        return self._staging[:total_tokens].flatten(-2)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -214,7 +536,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
         embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
+            Qwen4ExpPLEFileGatherEmbedding
+            if engram_config is not None and engram_config.host_file_gather
+            else Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
@@ -382,7 +706,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
         embedding = self.ngram_embedding
-        if embedding.supports_prefetch:
+        if embedding.supports_prefetch or isinstance(
+            embedding, Qwen4ExpPLEFileGatherEmbedding
+        ):
             # Prefetch contains full tokens even when hidden states are sharded.
             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
         else:
@@ -477,6 +803,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"NVFP4 PLE shard {shard_index} {suffix} requires "
                         f"{parameter.dtype}, got {loaded_weight.dtype}"
                     )
+                if isinstance(embedding, Qwen4ExpPLEFileGatherEmbedding):
+                    embedding.accept_checkpoint_shard(
+                        shard_index, loaded_weight, shard_size,
+                        param_name=suffix,
+                    )
+                    loaded.add(f"ngram_embedding.{suffix}")
+                    continue
                 parameter.weight_loader(
                     parameter,
                     loaded_weight,
@@ -497,3 +830,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
+
+def stage_checkpoint_rows(
+    modules: list[Qwen4ExpNGramEmbedding],
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+) -> None:
+    """Stage host-file-gather PLE rows for one step behind a single stream sync."""
+    num_tokens = input_ids.shape[0]
+    for module in modules:
+        ids = module.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        module.ngram_embedding._host_ids[:num_tokens].copy_(
+            ids, non_blocking=True
+        )
+    if input_ids.device.type != "cpu":
+        torch.accelerator.current_stream().synchronize()
+    for module in modules:
+        module.ngram_embedding.stage_rows(num_tokens)

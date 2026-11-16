@@ -28,11 +28,18 @@ endif()
 
 FetchContent_MakeAvailable(deepselect)
 message(STATUS "DeepSelect is available at ${deepselect_SOURCE_DIR}")
+vllm_apply_external_patch(
+    "${deepselect_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/cmake/patches/deepselect_sm110.patch")
 
-# DeepSelect kernels require CUDA 12.9+; 10.0f (family) covers SM100 and SM103.
+# DeepSelect kernels require CUDA 12.9+; 10.0f covers SM100/SM103. CUDA 13+
+# exposes Thor as the separate SM110 family.
 set(DEEPSELECT_SUPPORT_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     list(APPEND DEEPSELECT_SUPPORT_ARCHS "10.0f")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+        list(APPEND DEEPSELECT_SUPPORT_ARCHS "11.0f")
+    endif()
 endif()
 
 cuda_archs_loose_intersection(DEEPSELECT_ARCHS "${DEEPSELECT_SUPPORT_ARCHS}" "${CUDA_ARCHS}")

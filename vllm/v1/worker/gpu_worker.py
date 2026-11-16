@@ -691,6 +691,12 @@ class Worker(WorkerBase):
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
+            # Compile b12x / CuTe-DSL kernels while the profiling window is
+            # still open. kernel_warmup() runs later (from
+            # compile_or_warm_up_model), but the throwaway graph-profiling
+            # capture below happens first, so without this every capture size
+            # JIT-compiles inside the capture window.
+            self._warmup_b12x_before_graph_profiling()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -805,6 +811,38 @@ class Worker(WorkerBase):
             self.model_config.multimodal_config,
             getattr(self.parallel_config, "_api_process_count", 1),
         )
+
+    def _warmup_b12x_before_graph_profiling(self) -> None:
+        """Pre-compile b12x kernels before any CUDA graph capture runs.
+
+        ``kernel_warmup()`` lives in ``compile_or_warm_up_model``, which the
+        engine calls after ``determine_available_memory``. The throwaway
+        graph-profiling capture happens inside
+        ``determine_available_memory``, so without this the first capture of
+        every shape compiles kernels cold.
+        """
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            return
+        if not self.vllm_config.kernel_config.enable_jit_warmup:
+            return
+        try:
+            from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
+
+            b12x_warmup(
+                self,
+                list(
+                    self.vllm_config.compilation_config.cudagraph_capture_sizes
+                    or []
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "b12x warmup before CUDA graph profiling failed; graph "
+                "capture may compile kernels cold."
+            )
 
     def get_kv_connector_handshake_metadata(
         self,

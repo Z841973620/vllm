@@ -31,6 +31,9 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(VLLM_USE_CUDA_ARCH_SPECIFIC
+  "Compile every requested CUDA target as exact SASS instead of using family or PTX fallbacks"
+  OFF)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -117,13 +120,25 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.4)
   # Rubin (10.7) can run SM100 family code, but CUDA 13.4 also supports
   # targeting it directly.
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0")
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC)
+    set(CUDA_SUPPORTED_ARCHS
+      "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.3;10.7;11.0;12.0;12.1")
+  else()
+    set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0")
+  endif()
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
    # starting from CUDA 12.9 and Blackwell (10.0), we use family-specific targets (10.0f, 12.0f, etc)
    # to support the whole generation without specifying all sub-architectures
    # see: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC)
+    # Keep every Blackwell minor architecture so the user's explicit `a`
+    # targets survive the initial supported-architecture filter.
+    set(CUDA_SUPPORTED_ARCHS
+      "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.3;11.0;12.0;12.1")
+  else()
+    set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
+  endif()
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
@@ -220,6 +235,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   warn_if_ptx_arch_requested("${CUDA_ARCH_FLAGS}")
   extract_unique_cuda_archs_ascending(CUDA_ARCHS "${CUDA_ARCH_FLAGS}")
   message(STATUS "CUDA target architectures: ${CUDA_ARCHS}")
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC)
+    message(STATUS "CUDA exact architecture-specific SASS mode: ON")
+  endif()
   # Filter the target architectures by the supported supported archs
   # since for some files we will build for all CUDA_ARCHS.
   cuda_archs_loose_intersection(CUDA_ARCHS

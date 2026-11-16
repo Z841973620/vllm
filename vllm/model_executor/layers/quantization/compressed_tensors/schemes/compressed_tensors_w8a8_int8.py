@@ -33,8 +33,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # sm_72 (Xavier) runs via the wmma IMMA kernel; sm_75+ uses CUTLASS.
-        return 72
+        # turing and up
+        return 75
 
     def create_weights(
         self,

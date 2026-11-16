@@ -39,6 +39,54 @@ function (run_python OUT EXPR ERR_MSG)
   set(${OUT} ${PYTHON_OUT} PARENT_SCOPE)
 endfunction()
 
+# Apply a patch to a fetched external project during CMake configuration.
+# Reconfiguration is idempotent: an already-applied patch is accepted, while
+# any other mismatch is fatal so a pinned dependency cannot silently drift.
+function(vllm_apply_external_patch SOURCE_DIR PATCH_FILE)
+  if(NOT IS_DIRECTORY "${SOURCE_DIR}")
+    message(FATAL_ERROR "External source directory does not exist: ${SOURCE_DIR}")
+  endif()
+  if(NOT EXISTS "${PATCH_FILE}")
+    message(FATAL_ERROR "External project patch does not exist: ${PATCH_FILE}")
+  endif()
+
+  find_program(_VLLM_PATCH_GIT_EXECUTABLE NAMES git REQUIRED)
+  execute_process(
+    COMMAND "${_VLLM_PATCH_GIT_EXECUTABLE}" -C "${SOURCE_DIR}"
+            apply --check "${PATCH_FILE}"
+    RESULT_VARIABLE _patch_check_result
+    ERROR_VARIABLE _patch_check_error)
+
+  if(_patch_check_result EQUAL 0)
+    execute_process(
+      COMMAND "${_VLLM_PATCH_GIT_EXECUTABLE}" -C "${SOURCE_DIR}"
+              apply "${PATCH_FILE}"
+      RESULT_VARIABLE _patch_apply_result
+      ERROR_VARIABLE _patch_apply_error)
+    if(NOT _patch_apply_result EQUAL 0)
+      message(FATAL_ERROR
+        "Failed to apply ${PATCH_FILE} to ${SOURCE_DIR}: ${_patch_apply_error}")
+    endif()
+    message(STATUS "Applied external project patch: ${PATCH_FILE}")
+    return()
+  endif()
+
+  execute_process(
+    COMMAND "${_VLLM_PATCH_GIT_EXECUTABLE}" -C "${SOURCE_DIR}"
+            apply --reverse --check "${PATCH_FILE}"
+    RESULT_VARIABLE _patch_reverse_check_result
+    ERROR_VARIABLE _patch_reverse_check_error)
+  if(_patch_reverse_check_result EQUAL 0)
+    message(STATUS "External project patch already applied: ${PATCH_FILE}")
+    return()
+  endif()
+
+  message(FATAL_ERROR
+    "Cannot apply ${PATCH_FILE} to ${SOURCE_DIR}.\n"
+    "Forward check: ${_patch_check_error}\n"
+    "Reverse check: ${_patch_reverse_check_error}")
+endfunction()
+
 # Run `EXPR` in python after importing `PKG`. Use the result of this to extend
 # `CMAKE_PREFIX_PATH` so the torch cmake configuration can be imported.
 macro (append_cmake_prefix_path PKG EXPR)
@@ -417,6 +465,76 @@ function(cuda_archs_loose_intersection OUT_CUDA_ARCHS SRC_CUDA_ARCHS TGT_CUDA_AR
   # match — e.g. SRC="12.0f" matches TGT="12.1a" since SM121 is in the SM12x
   # family. The output uses TGT's value to preserve the user's compilation flags.
   set(_CUDA_ARCHS)
+
+  # A +PTX source entry is normally a forward-compatible fallback: for example,
+  # 8.0+PTX lets one compute_80 image cover every newer requested target. In
+  # architecture-specific mode, compile that source once for every compatible
+  # requested target instead. This preserves the user's exact target spelling
+  # (including `a`) and emits SASS only.
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC AND _PTX_ARCHS)
+    set(_SASS_TARGETS)
+    foreach(_tgt ${_TGT_CUDA_ARCHS})
+      string(REGEX REPLACE "[af]$" "" _tgt_base "${_tgt}")
+      set(_ptx_match FALSE)
+      foreach(_ptx_src ${_PTX_ARCHS})
+        string(REGEX REPLACE "[af]$" "" _ptx_base "${_ptx_src}")
+        if(_ptx_base VERSION_LESS_EQUAL _tgt_base)
+          set(_ptx_match TRUE)
+          break()
+        endif()
+      endforeach()
+      if(_ptx_match)
+        list(APPEND _CUDA_ARCHS "${_tgt}")
+        list(APPEND _SASS_TARGETS "${_tgt}")
+      endif()
+    endforeach()
+    if(_SASS_TARGETS)
+      list(REMOVE_ITEM _TGT_CUDA_ARCHS ${_SASS_TARGETS})
+    endif()
+  endif()
+
+  # CUDA 13+ source lists use family-specific entries such as 10.0f and
+  # 12.0f. When architecture-specific mode is requested, expand each family
+  # capability entry to every compatible user-requested `a` target instead of
+  # allowing the normal loose intersection to collapse the family to one
+  # target. A source baseline X.Yf can be compiled for X.Za when Z >= Y.
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC)
+    set(_ARCH_SPECIFIC_TARGETS)
+    foreach(_tgt ${_TGT_CUDA_ARCHS})
+      if(_tgt MATCHES "a$")
+        string(REGEX REPLACE "a$" "" _tgt_base "${_tgt}")
+        string(REGEX REPLACE "^([0-9]+)\\..*$" "\\1"
+          _tgt_major "${_tgt_base}")
+        set(_family_match FALSE)
+        set(_family_match_ptx FALSE)
+        foreach(_src ${_SRC_CUDA_ARCHS})
+          if(_src MATCHES "f$")
+            string(REGEX REPLACE "f$" "" _src_base "${_src}")
+            string(REGEX REPLACE "^([0-9]+)\\..*$" "\\1"
+              _src_major "${_src_base}")
+            if(_src_major STREQUAL _tgt_major AND
+               _src_base VERSION_LESS_EQUAL _tgt_base)
+              set(_family_match TRUE)
+              if(_src IN_LIST _PTX_ARCHS)
+                set(_family_match_ptx TRUE)
+              endif()
+            endif()
+          endif()
+        endforeach()
+        if(_family_match)
+          list(APPEND _CUDA_ARCHS "${_tgt}")
+          list(APPEND _ARCH_SPECIFIC_TARGETS "${_tgt}")
+          if(_family_match_ptx)
+            list(APPEND _PTX_ARCHS "${_tgt}")
+          endif()
+        endif()
+      endif()
+    endforeach()
+    if(_ARCH_SPECIFIC_TARGETS)
+      list(REMOVE_ITEM _TGT_CUDA_ARCHS ${_ARCH_SPECIFIC_TARGETS})
+    endif()
+  endif()
+
   # Resolve exact base matches before family fallbacks so a generic entry such
   # as 10.0f cannot consume a 10.7 target that has a 10.7f source entry.
   foreach(_arch ${_SRC_CUDA_ARCHS})
@@ -500,6 +618,15 @@ function(cuda_archs_loose_intersection OUT_CUDA_ARCHS SRC_CUDA_ARCHS TGT_CUDA_AR
   endforeach()
 
   list(REMOVE_DUPLICATES _CUDA_ARCHS)
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC)
+    list(SORT _CUDA_ARCHS COMPARE NATURAL ORDER ASCENDING)
+  endif()
+
+  # Exact-SASS mode must never reapply +PTX to an architecture that originated
+  # from a PTX fallback. Those entries were expanded to concrete targets above.
+  if(VLLM_USE_CUDA_ARCH_SPECIFIC)
+    set(_PTX_ARCHS)
+  endif()
 
   # reapply +PTX suffix to architectures that requested PTX
   set(_FINAL_ARCHS)

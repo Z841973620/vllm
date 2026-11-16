@@ -198,6 +198,9 @@ def select_nvfp4_moe_backend(
     """
     # Prefer the native SM12x FP4 kernel. Its support check rejects all other
     # architectures, so the remaining order is unchanged outside SM120/121.
+    # (upstream v0.32.0 excluded FLASHINFER_B12X from auto-selection pending
+    # the CUTLASS SM121 MMA op guard; our DGX Spark deployments validated it
+    # through 0.31, so the 0.31 ordering is restored here.)
     AVAILABLE_BACKENDS = [
         NvFp4MoeBackend.FLASHINFER_B12X,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,

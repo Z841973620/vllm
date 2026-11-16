@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import threading
 import weakref
 from dataclasses import dataclass
@@ -18,16 +19,40 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.utils.b12x import B12xWarmupUnit
 from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class _B12xSharedCudaGraphBuffers:
+    """B12x buffers reused by identically-shaped, sequential MoE layers."""
+
+    static_workspace: Any
+    dynamic_workspace: Any
+    output: torch.Tensor
+
+# vLLM invokes these same-shaped layers sequentially and copies each wrapper's
+# result into caller-owned output before invoking the next layer, so their large
+# graph-safe workspaces and staging output do not need per-layer allocations.
+# A model keeps each entry alive through ``FlashInferB12xExperts._shared_buffers``.
+# Weak values avoid retaining GPU memory after the model is unloaded.  Access is
+# serialized because model construction can prepare layers from multiple threads.
+_B12X_SHARED_BUFFERS: weakref.WeakValueDictionary[
+    tuple[Any, ...], _B12xSharedCudaGraphBuffers
+] = weakref.WeakValueDictionary()
+_B12X_SHARED_BUFFERS_LOCK = threading.Lock()
 
 
 @dataclass
@@ -181,6 +206,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             num_groups=num_experts_w2,
         )
 
+        # Let vllm.model_executor.warmup.b12x_warmup pre-compile this layer's
+        # CuTe-DSL kernels and build any padded weight copies ahead of graph
+        # capture instead of inside the capture window.
+        layer.b12x_warmup_provider = self
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -256,10 +286,60 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # from pre-quantizing activations.
         return True
 
+    def _avoid_static_repad(self) -> None:
+        """Keep b12x's static backend from re-padding the expert weights.
+
+        ``launch_sm120_moe`` pads the intermediate dim up to
+        ``_STATIC_RETAINED_GROUP_N`` (256) when the static backend runs and ``n``
+        is not already a multiple of it. The padded copy spans every expert, so
+        for a 512-expert layer with n=640 (padded to 768) it is ~1 GiB per
+        layer, built on the first static call and cached for the process. When
+        that first call happens inside CUDA graph capture, the allocation lands
+        in the capture window and can exhaust device memory.
+
+        Sizes that are a multiple of the N tile (128) but not of the retained
+        group (256) would pay that cost, so route them to the dynamic backend,
+        which uses native N128 geometry and never pads. Shapes that are not
+        N128-aligned already go through the wrapper's own pad-to-128 path and
+        are unaffected.
+        """
+        n = self.intermediate_size_per_partition
+        if n % 128 != 0 or n % 256 == 0:
+            return
+        if self.num_local_experts != self.global_num_experts:
+            # The dynamic backend indexes global topk ids, so it requires
+            # num_local_experts == num_experts. Leave EP alone.
+            return
+        var = "FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS"
+        if var in os.environ:
+            return
+        os.environ[var] = "0"
+        # The selector memoizes the cutover; drop any value cached before this
+        # point so the override takes effect.
+        try:
+            import sys
+
+            mod = sys.modules.get(
+                "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch"
+            )
+            if mod is not None:
+                mod._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+        except Exception:
+            pass
+        logger.info_once(
+            "b12x MoE: intermediate_size=%d is not a multiple of 256, so the "
+            "static backend would build a padded weight copy for every expert. "
+            "Routing to the dynamic backend (%s=0) to avoid that allocation.",
+            n,
+            var,
+        )
+
     def _ensure_wrapper(self) -> None:
         """Lazily create B12xMoEWrapper on first use."""
         if self._wrapper is not None:
             return
+
+        self._avoid_static_repad()
 
         from flashinfer.fused_moe import B12xMoEWrapper
 
@@ -310,6 +390,76 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             # layer using the shared buffers remains alive.
             self._shared_buffers = shared
             self._wrapper = wrapper
+
+    def get_b12x_warmup_unit(
+        self,
+        layer: torch.nn.Module,
+        token_counts: tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> B12xWarmupUnit:
+        """Compile this layer's serving-shape CuTe-DSL kernels ahead of capture."""
+        assert output_dtype == self.out_dtype, (
+            f"warmup dtype {output_dtype} != expert dtype {self.out_dtype}"
+        )
+        device = torch.device(layer.w13_weight.device)
+
+        def compile() -> None:
+            for tokens in token_counts:
+                if tokens <= 0:
+                    continue
+                self.apply(
+                    output=torch.empty(
+                        (tokens, self.hidden_dim),
+                        dtype=output_dtype,
+                        device=device,
+                    ),
+                    hidden_states=torch.zeros(
+                        (tokens, self.hidden_dim),
+                        dtype=output_dtype,
+                        device=device,
+                    ),
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=torch.full(
+                        (tokens, self.topk),
+                        1.0 / self.topk,
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    topk_ids=torch.zeros(
+                        (tokens, self.topk),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    activation=layer.activation,
+                    global_num_experts=self.global_num_experts,
+                    expert_map=None,
+                    a1q_scale=None,
+                    a2_scale=None,
+                    workspace13=None,
+                    workspace2=None,
+                    expert_tokens_meta=None,
+                    apply_router_weight_on_input=bool(
+                        getattr(layer, "apply_router_weight_on_input", False)
+                    ),
+                )
+
+        return B12xWarmupUnit(
+            name="MoE",
+            key=(
+                type(self),
+                device,
+                output_dtype,
+                self.global_num_experts,
+                self.num_local_experts,
+                self.hidden_dim,
+                self.intermediate_size_per_partition,
+                self.topk,
+                self.max_num_tokens,
+                self._activation_str,
+            ),
+            compile=compile,
+        )
 
     def apply(
         self,

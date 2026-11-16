@@ -549,10 +549,14 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        # B12x first: it is the only warp-level MXFP8 kernel here and it has no
+        # shape restriction, so narrow-N projections (N < 128, which
+        # FlashInferCutlassMxfp8LinearKernel rejects) stay on a real kernel
+        # instead of falling through to Marlin or BF16 emulation.
+        B12xMxfp8LinearKernel,
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
-        B12xMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
         HummingMxfp8LinearKernel,
         FlashInferTrtllmMxfp8LinearKernel,
@@ -1171,14 +1175,20 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     elif linear_backend == "auto" and use_a16:
         _cc = current_platform.get_device_capability()
         compute_capability = _cc.to_int() if _cc is not None else None
-        # SM12x has a native FP4 tensor-core path: dynamically quantize the
-        # BF16 activation and run the FlashInfer B12x block-scaled GEMM.  Do
-        # not silently replace it with Marlin, which is a weight-only path.
-        if compute_capability is not None and 120 <= compute_capability < 130:
+        # Weight-only: prefer FlashInfer b12x warp-level MMA on SM12x (the
+        # dedicated Sm120B12x kernel with dynamic FP4 activation quant),
+        # CuTe-DSL W4A16 on SM100/103/110 (tcgen05), then Humming/Marlin.
+        b12x_ok, _ = FlashInferB12xNvFp4LinearKernel.is_supported(
+            compute_capability
+        )
+        cutedsl_ok, _ = FlashInferCuteDslNvFp4W4A16LinearKernel.is_supported(
+            compute_capability
+        )
+        if compute_capability is not None and 120 <= compute_capability < 130 and b12x_ok:
             force_kernel = FlashInferB12xNvFp4LinearKernel
-        # SM100/103/110 share tcgen05.  FlashInfer's W4A16 kernel expands the
-        # FP4 weights to BF16 fragments before issuing tcgen05 BF16 MMA.
-        elif compute_capability in (100, 103, 110):
+        # SM110 (Thor) is CUDA 13's rename of SM101 and shares the tcgen05
+        # family with SM100/SM103, so the same W4A16 kernel serves all three.
+        elif compute_capability in (100, 103, 110) and cutedsl_ok:
             force_kernel = FlashInferCuteDslNvFp4W4A16LinearKernel
         elif not prefers_humming(compute_capability):
             force_kernel = MarlinNvFp4LinearKernel

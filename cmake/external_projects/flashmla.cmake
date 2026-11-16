@@ -29,6 +29,9 @@ endif()
 
 FetchContent_MakeAvailable(flashmla)
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
+vllm_apply_external_patch(
+    "${flashmla_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/cmake/patches/flashmla_sm110.patch")
 
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
 set(FLASHMLA_VENDOR_DIR "${CMAKE_SOURCE_DIR}/vllm/third_party/flashmla")
@@ -62,6 +65,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     list(APPEND SUPPORT_ARCHS "10.0f")
     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.4)
         list(APPEND SUPPORT_ARCHS "10.7f")
+    endif()
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+        list(APPEND SUPPORT_ARCHS "11.0f")
     endif()
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     list(APPEND SUPPORT_ARCHS "10.0a")

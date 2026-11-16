@@ -1,0 +1,17 @@
+diff --git a/csrc/api.cpp b/csrc/api.cpp
+index c6e238f..454e270 100644
+--- a/csrc/api.cpp
++++ b/csrc/api.cpp
+@@ -147,7 +147,11 @@ void topk(
+         STD_TORCH_CHECK((uint32_t)vocab_size < MAX_VOCAB_SIZE,
+                     "vocab_size must be < 2^23 for bfloat16 input");
+         STD_TORCH_CHECK(topk <= 4096, "topk must be <= 4096");
+-        if (batch_size <= 6 && (uint32_t)vocab_size >= 512u * 1024u && topk <= 1024) {  // TODO Tune
++        // Thor (SM110) supports cluster launches, but not the non-portable
++        // 16-block cluster required by this specialization. Use the normal
++        // implementation there instead of failing with cluster misconfiguration.
++        if (device_prop.major != 11 && batch_size <= 6 &&
++                (uint32_t)vocab_size >= 512u * 1024u && topk <= 1024) {  // TODO Tune
+             INTEGER_TYPE_SWITCH(output_index_t, OutIdxT, [&]() {
+                 BOOL_SWITCH(sorted_index, SORTED_INDEX, [&]() {
+                     BOOL_SWITCH(return_value, RETURN_VALUE, [&]() {
