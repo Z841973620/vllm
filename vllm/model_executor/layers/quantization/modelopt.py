@@ -833,6 +833,29 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         )
 
 
+# Backends whose NVFP4 MoE implementation really serves weight-only experts
+# (BF16 activations, FP4 weights). Verified per backend:
+#   CUTEDSL  -- prepare_..._cutedsl drops a13/a2 when use_a16, apply() uses
+#               quant_mode="w4a16"
+#   MARLIN   -- prepare_..._for_marlin always discards a13/a2
+#   HUMMING  -- _supports_quant_scheme lists (kNvfp4Static, None) and defers
+#               input quantization to the kernel
+#   B12X     -- quantization happens in-kernel (excluded from the downgrade,
+#               listed for completeness)
+# FLASHINFER_CUTEDSL_BATCHED advertises (kNvfp4Static, None) but its
+# constructor asserts quant_dtype == "nvfp4" and it folds the activation
+# scales into the weight scales, so it cannot serve a checkpoint that has
+# none. EMULATION/TRTLLM/CUTLASS do not accept the weight-only key at all.
+_W4A16_NVFP4_MOE_BACKENDS = frozenset(
+    {
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        NvFp4MoeBackend.MARLIN,
+        NvFp4MoeBackend.HUMMING,
+        NvFp4MoeBackend.B12X,
+    }
+)
+
+
 class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     """MoE Method for FP4 Quantization.
 
@@ -1062,6 +1085,20 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             weight_key=kNvfp4Static,
             activation_key=None,
         )
+        if self.nvfp4_backend not in _W4A16_NVFP4_MOE_BACKENDS:
+            # Some backends accept the (weight-only, BF16 activations) quant
+            # key but never implement the conversion for it -- they keep
+            # passing the activation scales straight through. Since this
+            # checkpoint has none, those would consume the NaN sentinel.
+            raise ValueError(
+                "NVFP4 MoE checkpoint declares NVFP4 (W4A4) experts but stores "
+                "no activation scales, and the selected "
+                f"'{self.nvfp4_backend.value}' backend has no weight-only "
+                f"(W4A16) NVFP4 MoE path. Available weight-only backends: "
+                f"{[b.value for b in _W4A16_NVFP4_MOE_BACKENDS]}. Select one "
+                "with --kernel-config moe_backend=..., or fix the checkpoint's "
+                "missing input_scale tensors."
+            )
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
