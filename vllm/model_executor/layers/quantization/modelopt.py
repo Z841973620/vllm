@@ -989,21 +989,89 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         global_sf_num_experts = (
             global_num_experts if self.use_global_sf else num_experts
         )
-        w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(
-                global_sf_num_experts,
-                w13_num_shards,
+        # A W4A4 NVFP4 MoE needs the checkpoint's calibrated activation
+        # scales. Some exports declare quant_algo NVFP4 for the experts while
+        # storing weight-only tensors (no `input_scale` anywhere), leaving
+        # these parameters at whatever create_weights put there. Fill them
+        # with NaN so process_weights_after_loading can tell "never loaded"
+        # from a genuine static scale -- consuming uninitialised memory there
+        # silently corrupts the activations. b12x ignores the activation
+        # scales, so it keeps plain zeros.
+        missing_scale_sentinel = (
+            not self.use_a16
+            and self.nvfp4_backend != NvFp4MoeBackend.B12X
+        )
+        if missing_scale_sentinel:
+            w13_input_scale_data = torch.full(
+                (global_sf_num_experts, w13_num_shards),
+                float("nan"),
                 dtype=torch.float32,
-            ),
+            )
+            w2_input_scale_data = torch.full(
+                (global_sf_num_experts,), float("nan"), dtype=torch.float32
+            )
+        else:
+            w13_input_scale_data = torch.zeros(
+                global_sf_num_experts, w13_num_shards, dtype=torch.float32
+            )
+            w2_input_scale_data = torch.zeros(
+                global_sf_num_experts, dtype=torch.float32
+            )
+        w13_input_scale = PerTensorScaleParameter(
+            data=w13_input_scale_data,
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_sf_num_experts, dtype=torch.float32),
+            data=w2_input_scale_data,
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
+
+    def _activation_scales_missing(self, layer: RoutedExperts) -> bool:
+        """Whether the checkpoint never provided this layer's activation scales.
+
+        ``create_weights`` seeds them with NaN for W4A4-declared NVFP4 MoE
+        layers, so an untouched parameter is all-NaN. A genuine W4A4 export
+        always stores both ``w13_input_scale`` and ``w2_input_scale``. A
+        partial set counts as missing: the W4A4 kernel folds each scale into
+        the expert alphas, so one unloaded scale is as fatal as both.
+        """
+        for name in ("w13_input_scale", "w2_input_scale"):
+            scale = getattr(layer, name, None)
+            if scale is None or torch.isnan(scale.detach()).all():
+                return True
+        return False
+
+    def _downgrade_to_w4a16(self, layer: RoutedExperts) -> None:
+        """Serve a weight-only NVFP4 MoE through the W4A16 path.
+
+        Such a checkpoint declares ``quant_algo: NVFP4`` for the experts but
+        stores only ``weight`` / ``weight_scale`` / ``weight_scale_2`` -- the
+        same tensors a ``W4A16_NVFP4`` layer carries. Running it as W4A4 would
+        quantize BF16 activations against an activation scale that does not
+        exist, so the weights are read weight-only instead: BF16 activations,
+        FP4 weights. The backend and expert class were picked for the W4A4
+        activation key, so both are re-resolved for ``activation_key=None``.
+        """
+        self.use_a16 = True
+        self.per_token_activation = False
+        self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
+            config=self.moe,
+            weight_key=kNvfp4Static,
+            activation_key=None,
+        )
+        self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
+            self.nvfp4_backend
+        )
+        logger.warning_once(
+            "NVFP4 MoE checkpoint declares W4A4 for %s but stores no activation "
+            "scales; running the experts weight-only as W4A16 (BF16 activations) "
+            "on the '%s' backend.",
+            type(layer).__name__,
+            self.nvfp4_backend.value,
+        )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
@@ -1016,6 +1084,14 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             self._restore_padded_moe_dims(layer)
             self._build_moe_kernel(layer)
             return
+
+        if (
+            not self.use_a16
+            and self.quant_config.moe_activation_override is None
+            and self.nvfp4_backend != NvFp4MoeBackend.B12X
+            and self._activation_scales_missing(layer)
+        ):
+            self._downgrade_to_w4a16(layer)
 
         if self.per_token_activation:
             layer.w13_input_scale.data.fill_(1.0)
