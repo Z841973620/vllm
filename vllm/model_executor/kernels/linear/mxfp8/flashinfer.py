@@ -126,7 +126,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
 
 
 class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
-    """MXFP8 W8A8 GEMM via FlashInfer CuTe-DSL (SM100/SM103)."""
+    """MXFP8 W8A8 GEMM via FlashInfer CuTe-DSL (SM100/SM103/SM110)."""
 
     supports_pre_processed_weights = True
 
@@ -138,7 +138,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(100)
         ):
-            return False, "requires sm_100/sm_103 (Blackwell)"
+            return False, "requires sm_100/sm_103/sm_110 (Blackwell family)"
         if not has_flashinfer_cutedsl():
             return False, "requires FlashInfer CuTe-DSL module"
         return True, None
@@ -209,6 +209,8 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
+        if current_platform.is_device_capability(110):
+            return False, "FlashInfer TRTLLM cubins are disabled on SM110"
         if not (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(100)

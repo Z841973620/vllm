@@ -150,7 +150,13 @@ def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
 
     """
     backend = envs.VLLM_FLASHINFER_ALLREDUCE_BACKEND
+    is_sm110 = current_platform.is_device_capability(110)
     if backend != "auto":
+        if is_sm110 and backend == "trtllm":
+            raise ValueError(
+                "FlashInfer TRT-LLM all-reduce is disabled on SM110; "
+                "use mnnvl or the standard vLLM/NCCL all-reduce path."
+            )
         logger.debug_once("Using flashinfer allreduce backend: %s", backend)
         return backend, False
 

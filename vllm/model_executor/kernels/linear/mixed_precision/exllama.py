@@ -16,7 +16,13 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
 class ExllamaLinearKernel(MPLinearKernel):
-    SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
+    # uint4 (asymmetric, with zero points) is the native GPTQ format the
+    # Exllama kernels -- and the sm_72 w4a16 path -- consume via qzeros.
+    SUPPORTED_QUANT_TYPES = [
+        scalar_types.uint4,
+        scalar_types.uint4b8,
+        scalar_types.uint8b128,
+    ]
     # In theory supports `scalar_types.uint2b2, scalar_types.uint3b4` too but
     # currently untested so not added to the list
 
@@ -68,6 +74,25 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         return True, None
 
+    def __init__(
+        self,
+        c: MPLinearLayerConfig,
+        w_q_param_name: str,
+        w_s_param_name: str,
+        w_zp_param_name: str | None = None,
+    ) -> None:
+        super().__init__(c, w_q_param_name, w_s_param_name, w_zp_param_name)
+        # sm_72 (Xavier): the Exllama CUDA-core FMA path is issue-bound;
+        # route 4-bit GEMM through the wmma/GEMV-based w4a16_sm72 kernels
+        # instead (they consume the same shuffled tensors). The tile kernel
+        # requires group_size % 64 == 0; anything else falls back.
+        self._sm72_w4 = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability().to_int() == 72
+            and c.weight_type.size_bits == 4
+            and c.group_size % 64 == 0
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         c = self.config
 
@@ -116,9 +141,23 @@ class ExllamaLinearKernel(MPLinearKernel):
             x.data = x.data.contiguous()
             return x.to(dtype=c.act_type)
 
+        # Compressed-tensors WNA16 stores zero points as [N/pack, groups]
+        # (packed along the output dim, sequential nibble order). The
+        # Exllama/w4a16_sm72 kernels want [groups, N/pack] with the same
+        # sequential nibble order -- a plain transpose, NO gptq_shuffle
+        # (verified bit-exact against spec dequant on real weights).
+        def transform_w_zp(x):
+            return x.data.t().contiguous()
+
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
+        if c.zero_points and getattr(layer, self.w_zp_name or "", None) is not None:
+            zp = getattr(layer, self.w_zp_name)
+            groups = c.partition_weight_shape[0] // c.group_size
+            n_pack = c.partition_weight_shape[1] // (32 // c.weight_type.size_bits)
+            if zp.dim() == 2 and zp.shape == (n_pack, groups) and n_pack != groups:
+                self._transform_param(layer, self.w_zp_name, transform_w_zp)
 
     def apply_weights(
         self,
@@ -138,9 +177,14 @@ class ExllamaLinearKernel(MPLinearKernel):
         use_v2_format = False
 
         assert w_zp is not None, "Zero points are required by Exllama"
-        output = ops.gptq_gemm(
-            x_2d, w_q, w_zp, w_s, True, use_v2_format, c.weight_type.size_bits
-        )
+        if self._sm72_w4:
+            output = torch.ops._C.w4a16_sm72_gemm(
+                x_2d, w_q, w_zp, w_s, c.group_size, c.weight_type.size_bits
+            )
+        else:
+            output = ops.gptq_gemm(
+                x_2d, w_q, w_zp, w_s, True, use_v2_format, c.weight_type.size_bits
+            )
 
         if bias is not None:
             output.add_(bias)

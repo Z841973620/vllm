@@ -580,12 +580,20 @@ class Platform:
         device_id: int = 0,
     ) -> bool:
         """Returns True if the device capability is any <major>.x.
-        Mirrors CUDA 13 'family' architecture semantics (e.g. 10.x, 11.x, 12.x).
+
+        CUDA 13 renamed Thor from SM101 to SM110 without changing its
+        tcgen05 architecture family.  Consequently SM110 is a member of both
+        the CUDA capability 11.x family and the logical SM100 family used by
+        kernels that also support SM100/SM103.
         """
         current_capability = cls.get_device_capability(device_id=device_id)
         if current_capability is None:
             return False
-        return (current_capability.to_int() // 10) == (capability // 10)
+        current = current_capability.to_int()
+        requested_family = capability // 10
+        if current == 110 and requested_family == 10:
+            return True
+        return (current // 10) == requested_family
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

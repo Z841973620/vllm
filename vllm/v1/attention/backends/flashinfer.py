@@ -96,6 +96,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
+FLASHINFER_WORKSPACE_BUFFER_SIZE_THOR = 768 * 1024 * 1024
 FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -565,16 +566,23 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         # https://github.com/flashinfer-ai/flashinfer/blob/3d55c71a62052c590c130897d3a3db49b14fcc34/include/flashinfer/utils.cuh#L157
+        # SM75 has a 64 KiB per-block shared-memory limit; head sizes above
+        # 256 do not fit (mirrors vllm#55380: head_size > 256 rejected on
+        # SM75).
+        capability = current_platform.get_device_capability()
+        if capability is not None and (
+            capability.major, capability.minor
+        ) == (7, 5):
+            return [64, 128, 256]
         return [64, 128, 256, 512]
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer supports SM75+, but is currently broken on SM75 (Turing):
-        # https://github.com/flashinfer-ai/flashinfer/issues/3620 (fix:
-        # https://github.com/flashinfer-ai/flashinfer/pull/3621). Temporarily
-        # raise the floor to SM80 so it is not auto-selected on SM75 until
-        # that fix lands; revert to DeviceCapability(7, 5) once it does.
-        return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
+        # FlashInfer supports SM75+. The SM75 64 KiB per-block shared-memory
+        # limit broke prefill launches (flashinfer#3620); the two-point smem
+        # budget fix is backported into the flashinfer build shipped with
+        # these wheels (flashinfer#3620 fix + #3621). Mirrors vllm#55380.
+        return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
 
@@ -602,9 +610,8 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
-        capability = current_platform.get_device_capability()
-        if capability is not None and capability.major == 10:
-            # The trtllm-gen kernels consume head-major block interiors; the L/B
+        if current_platform.is_device_capability_family(100):
+            # The SM100-family kernels consume head-major block interiors; the L/B
             # nesting outside the block is immaterial to them.
             return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
         return super().supported_kv_cache_layouts()
@@ -999,6 +1006,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # if cache_config requests a quantized dtype globally.
         cache_dtype = self.cache_dtype
 
+        is_thor = current_platform.is_device_capability(
+            101
+        ) or current_platform.is_device_capability(110)
+
         # On SM90/SM12x, XQA decode requires BF16/FP16-Q even with FP8 KV cache.
         # FI native prefill on SM90 still uses FP8-Q in that case; SM12x prefill
         # is fa2-only and keeps the model dtype (handled below).
@@ -1022,7 +1033,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # consume FP8 queries, so keep the model dtype for Q there.
             if current_platform.is_device_capability(
                 90
-            ) or current_platform.is_device_capability_family(100):
+            ) or (
+                current_platform.is_device_capability_family(100)
+                and not is_thor
+            ):
                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
             return self.model_config.dtype
         if cache_dtype.startswith("nvfp4"):
@@ -1123,6 +1137,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     * self.head_dim
                     * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
                 )
+                # Thor uses FlashInfer native FA2 rather than the packaged
+                # TRTLLM cubins. Large-page hybrid models can require over
+                # 500 MiB just for batch_prefill_tmp_v while profiling CUDA
+                # graphs (for example 1024 requests with a 1600-token page).
+                # Keep headroom above that planner requirement. CUDA 12.x
+                # identified the same device as SM101.
+                if (
+                    current_platform.is_device_capability(101)
+                    or current_platform.is_device_capability(110)
+                ):
+                    est = max(est, FLASHINFER_WORKSPACE_BUFFER_SIZE_THOR)
                 buffer_size = max(buffer_size, est)
             self._workspace_buffer = torch.zeros(
                 buffer_size, dtype=torch.uint8, device=self.device

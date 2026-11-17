@@ -749,8 +749,8 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
             self.kv_cache_quant_algo = kv_cache_quant_algo
 
         # Validate the quant_algo; resolve() maps it to a QuantSpec at dispatch.
-        # NVFP4       -> W4A4: cutlass NVFP4 GEMM with input quantization
-        # W4A16_NVFP4 -> W4A16: FP4 Marlin GEMM with bf16/fp16 activations
+        # NVFP4       -> W4A4: native NVFP4 GEMM with input quantization
+        # W4A16_NVFP4 -> W4A16: architecture-native FP4 or Marlin fallback
         supported = algos_owned_by("modelopt_fp4")
         if quant_method not in supported:
             raise ValueError(
@@ -2714,8 +2714,9 @@ def resolve(algo: str, subcfg, prefix: str):
         # input scale). alpha = weight_gs * input_gs.
         return QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic), ctx, None
     if algo == "W4A16_NVFP4":
-        # W4A16: fp4 weight, no activation quant (-> Marlin). _DROP_INPUT_SCALE
-        # is a no-op for genuine exports; keeps legacy input_scale ckpts loading.
+        # W4A16: fp4 weight with no checkpoint activation scale. Native FP4
+        # backends derive a dynamic input scale; other architectures use Marlin.
+        # _DROP_INPUT_SCALE keeps legacy input_scale checkpoints loadable.
         return QuantSpec(weight=kNvfp4Static, activation=None), ctx, _DROP_INPUT_SCALE
     raise NotImplementedError(f"resolve: unsupported ModelOpt linear algo {algo!r}")
 

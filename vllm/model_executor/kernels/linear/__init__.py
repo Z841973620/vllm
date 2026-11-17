@@ -397,9 +397,8 @@ def _resolve_backend_kernels(
     layer_desc: str,
     *,
     quantization: str,
-    compute_capability: int | None = None,
 ) -> list[type]:
-    """Apply device priorities and --linear-backend filtering to a kernel list.
+    """Apply --linear-backend filtering to one layer type's kernel list.
 
     When the requested backend has no kernel for this layer type, fall back
     to the unfiltered list (with a WARNING log) instead of failing engine
@@ -408,7 +407,6 @@ def _resolve_backend_kernels(
     layer types (e.g. NVFP4 MoE projections next to FP8 attention
     projections).
     """
-    kernels = prioritize_humming(kernels, compute_capability)
     linear_backend = _get_linear_backend(quantization=quantization)
     if linear_backend == "auto":
         return kernels
@@ -706,7 +704,6 @@ def choose_scaled_mm_linear_kernel(
         platform_kernels,
         "scaled-mm",
         quantization=quantization,
-        compute_capability=compute_capability,
     )
 
     for kernel in platform_kernels:
@@ -897,7 +894,6 @@ def choose_mp_linear_kernel(
         platform_kernels,
         "mixed-precision",
         quantization="mixed_precision",
-        compute_capability=compute_capability,
     )
 
     failure_reasons = []
@@ -1128,9 +1124,10 @@ def init_wfp8_a16_linear_kernel(
 def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
-    config = NvFp4LinearLayerConfig()
+    config = NvFp4LinearLayerConfig(use_a16=use_a16)
     a16_kernels = (
         B12xNvFp4W4A16LinearKernel,
+        FlashInferB12xNvFp4LinearKernel,
         FlashInferCuteDslNvFp4W4A16LinearKernel,
         MarlinNvFp4LinearKernel,
         HummingNvFp4LinearKernel,
@@ -1174,12 +1171,14 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     elif linear_backend == "auto" and use_a16:
         _cc = current_platform.get_device_capability()
         compute_capability = _cc.to_int() if _cc is not None else None
-        # Weight-only: prefer FlashInfer CuTe-DSL W4A16 on SM100/103,
-        # Humming then Marlin where Humming is preferred, and Marlin elsewhere.
-        cutedsl_ok, _ = FlashInferCuteDslNvFp4W4A16LinearKernel.is_supported(
-            compute_capability
-        )
-        if compute_capability in (100, 103) and cutedsl_ok:
+        # SM12x has a native FP4 tensor-core path: dynamically quantize the
+        # BF16 activation and run the FlashInfer B12x block-scaled GEMM.  Do
+        # not silently replace it with Marlin, which is a weight-only path.
+        if compute_capability is not None and 120 <= compute_capability < 130:
+            force_kernel = FlashInferB12xNvFp4LinearKernel
+        # SM100/103/110 share tcgen05.  FlashInfer's W4A16 kernel expands the
+        # FP4 weights to BF16 fragments before issuing tcgen05 BF16 MMA.
+        elif compute_capability in (100, 103, 110):
             force_kernel = FlashInferCuteDslNvFp4W4A16LinearKernel
         elif not prefers_humming(compute_capability):
             force_kernel = MarlinNvFp4LinearKernel

@@ -49,9 +49,10 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             moe_config=moe_config,
             quant_config=quant_config,
         )
-        assert quant_config.quant_dtype == "nvfp4", (
+        assert quant_config.weight_quant_dtype == "nvfp4", (
             "Only nvfp4 quantization is currently supported."
         )
+        self.use_a16 = quant_config.quant_dtype is None
         self.out_dtype = moe_config.in_dtype
         self.hidden_dim = moe_config.hidden_dim
         self.intermediate_size_per_partition = (
@@ -77,8 +78,13 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
-        layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        if not self.use_a16:
+            layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
+            layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return self.use_a16
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -103,6 +109,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
     ) -> bool:
         SUPPORTED_W_A = [
+            # W4A16 (weight-only NVFP4, BF16 activations): the conversion
+            # path (nvfp4_w4a16_moe_quant_config) handles a16 already.
+            (kNvfp4Static, None),
             (kNvfp4Static, kNvfp4Dynamic),
             (kNvfp4Static, kNvfp4DynamicToken),
         ]
@@ -129,7 +138,10 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return self.per_token_activation
+        # NOTE: an earlier definition in this class returns self.use_a16;
+        # this later one shadows it. Account for both W4A16 (use_a16) and
+        # the W4A4 per-token-quantization mode.
+        return self.use_a16 or self.per_token_activation
 
     def workspace_shapes(
         self,
@@ -167,27 +179,36 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.quant_dtype == "nvfp4"
+        assert self.weight_quant_dtype == "nvfp4"
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
-        if self.expects_unquantized_inputs:
+        if self.use_a16:
+            # W4A16: quant_mode="w4a16" consumes BF16 activations directly;
+            # x_sf / fc2_input_scale / per_token_scale must all be None.
+            block_scale = None
+            per_token_scale = None
+            fc2_input_scale = None
+            x_sf = None
+        elif self.expects_unquantized_inputs:
             hidden_states, block_scale, per_token_scale = (
                 quantize_nvfp4_per_token_input(hidden_states)
             )
             fc2_input_scale = self.per_token_global_scale
+            # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
+            # The functional API expects x_sf with trailing dim:
+            # (M, K//16, 1).
+            x_sf = block_scale.unsqueeze(-1)
         else:
             assert a1q_scale is not None
             block_scale = a1q_scale
             per_token_scale = None
             fc2_input_scale = self.a2_gscale
+            x_sf = block_scale.unsqueeze(-1)
 
-        assert block_scale is not None
-        assert fc2_input_scale is not None
-
-        # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
-        # The functional API expects x_sf with trailing dim: (M, K//16, 1).
-        x_sf = block_scale.unsqueeze(-1)
+        if not self.use_a16:
+            assert block_scale is not None
+            assert fc2_input_scale is not None
 
         # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
         # values, so only forward the ones the model actually sets.
@@ -241,6 +262,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             activation_type=activation_to_flashinfer_int(
                 MoEActivation.SILU if activation == MoEActivation.SITU else activation
             ),
+            quant_mode="w4a16" if self.use_a16 else "w4a4",
             **swiglu_kwargs,
             **per_token_kwargs,
         )

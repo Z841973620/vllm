@@ -100,8 +100,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing and up
-        return 75
+        # XAVIER_WNA16: the Exllama and Triton W4A16 kernels run on
+        # sm_72 (min 60 / no floor); 75 was the Marlin-centric default.
+        return 72
 
     def create_weights(
         self,

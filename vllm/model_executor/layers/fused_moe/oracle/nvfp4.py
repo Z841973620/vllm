@@ -196,11 +196,10 @@ def select_nvfp4_moe_backend(
     """Select the primary NvFP4 MoE backend
     Note: Shape-specific fallbacks may still occur at runtime.
     """
-    # NOTE: the kernels are selected in the following order.
-    # FLASHINFER_B12X is intentionally excluded from auto-selection until
-    # the upstream CUTLASS SM121 MMA op guard is resolved; use
-    # moe_backend="flashinfer_b12x" to opt in explicitly.
+    # Prefer the native SM12x FP4 kernel. Its support check rejects all other
+    # architectures, so the remaining order is unchanged outside SM120/121.
     AVAILABLE_BACKENDS = [
+        NvFp4MoeBackend.FLASHINFER_B12X,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
@@ -339,11 +338,11 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
 ]:
     use_a16 = _use_a16(nvfp4_backend, use_a16)
     if nvfp4_backend == NvFp4MoeBackend.B12X:
@@ -394,6 +393,7 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale=w2_scale,
             w2_scale_2=w2_scale_2,
             a2_scale=a2_scale,
+            use_a16=use_a16,
         )
     elif (
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
@@ -529,8 +529,8 @@ def make_nvfp4_moe_quant_config(
     w2_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
     w2_scale_2: torch.Tensor,
-    a13_scale: torch.Tensor,
-    a2_scale: torch.Tensor,
+    a13_scale: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -579,6 +579,19 @@ def make_nvfp4_moe_quant_config(
     if backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
         w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
+        if use_a16:
+            return nvfp4_w4a16_moe_quant_config(
+                g1_alphas=w13_scale_2,
+                g2_alphas=w2_scale_2,
+                w1_scale=w13_scale,
+                w2_scale=w2_scale,
+                gemm1_alpha=swiglu_alpha,
+                gemm1_beta=swiglu_beta,
+                gemm1_clamp_limit=swiglu_limit,
+            )
+
+    if a13_scale is None or a2_scale is None:
+        raise ValueError(f"{backend.value} NVFP4 MoE requires activation scales")
 
     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
     # The expert's process_weights_after_loading will fuse activation

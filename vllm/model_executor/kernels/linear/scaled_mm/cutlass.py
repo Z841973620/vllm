@@ -38,6 +38,14 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        if compute_capability is None:
+            cc = current_platform.get_device_capability()
+            if cc is not None:
+                compute_capability = cc[0] * 10 + cc[1]
+        if compute_capability is not None and compute_capability < 75:
+            # CUTLASS INT8 kernels use the mma.sync m8n8k16 shape (sm_75+);
+            # sm_72 (Xavier) is served by WmmaSM72Int8ScaledMMLinearKernel.
+            return False, "requires sm_75 or higher."
         return True, None
 
     @classmethod

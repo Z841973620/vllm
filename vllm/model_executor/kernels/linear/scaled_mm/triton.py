@@ -32,6 +32,14 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
+            if current_platform.is_cuda():
+                if compute_capability is None:
+                    cc = current_platform.get_device_capability()
+                    if cc is not None:
+                        compute_capability = cc[0] * 10 + cc[1]
+                if compute_capability is not None and compute_capability < 75:
+                    # Triton's int8 dot lowers to mma.sync INT8 shapes (sm_75+).
+                    return False, "requires sm_75 or higher on CUDA."
             return True, None
         return False, "requires ROCm, CUDA or XPU."
 

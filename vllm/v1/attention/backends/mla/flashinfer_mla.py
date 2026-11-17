@@ -22,6 +22,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
@@ -57,7 +58,12 @@ def _trtllm_gen_mla_decode_supports_num_heads(num_heads: int) -> bool:
 
 
 def _select_mla_decode_backend(num_heads: int) -> str | None:
-    """cute-dsl for head counts trtllm-gen cannot tile, else None (=> auto)."""
+    """Select CuTeDSL when TRTLLM-gen must not be used, else auto."""
+    if current_platform.is_device_capability(110):
+        # CUDA 13 identifies Thor as SM110. The TRTLLM-gen package has no
+        # native SM110 cubins; never let FlashInfer's auto dispatcher select
+        # an SM100/103 binary on this device.
+        return "cute-dsl"
     if not _trtllm_gen_mla_decode_supports_num_heads(num_heads):
         logger.warning_once(
             "trtllm-gen MLA decode does not support num_heads=%d "

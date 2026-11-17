@@ -80,6 +80,9 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
     ) -> bool:
         SUPPORTED_W_A = [
+            # W4A16 (weight-only NVFP4, BF16 activations): the conversion
+            # path (nvfp4_w4a16_moe_quant_config) handles a16 already.
+            (kNvfp4Static, None),
             (kNvfp4Static, kNvfp4Dynamic),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A

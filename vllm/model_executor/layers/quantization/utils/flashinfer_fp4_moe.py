@@ -111,20 +111,21 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
-    a13_scale: torch.Tensor,
+    a13_scale: torch.Tensor | None,
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     w2_scale_2: torch.Tensor,
-    a2_scale: torch.Tensor,
+    a2_scale: torch.Tensor | None,
+    use_a16: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
 ]:
     """Prepare weights for the CuteDSL wrapper-based NvFP4 MoE backend.
 
@@ -132,13 +133,22 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     weight scale factors to the MMA layout expected by CuteDslMoEWrapper, and
     interleaves w13 gate/linear rows for gated activations.
     """
-    # Global scaling factors (same as other FlashInfer backends).
-    num_experts = w13.shape[0]
-    enable_eplb = layer.moe_config.moe_parallel_config.enable_eplb
-    a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
-        num_experts
-    )
-    a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(num_experts)
+    # W4A16 consumes BF16 activations directly.  W4A4 instead needs the
+    # checkpoint activation scales normalized across the local expert set.
+    if use_a16:
+        a13_scale = None
+        a2_scale = None
+    else:
+        if a13_scale is None or a2_scale is None:
+            raise ValueError("W4A4 CuTeDSL MoE requires activation scales")
+        num_experts = w13.shape[0]
+        enable_eplb = layer.moe_config.moe_parallel_config.enable_eplb
+        a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
+            num_experts
+        )
+        a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(
+            num_experts
+        )
 
     gated = layer.activation.is_gated
     if gated:

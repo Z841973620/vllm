@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+import weakref
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -25,6 +28,26 @@ from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+
+@dataclass
+class _B12xSharedCudaGraphBuffers:
+    """B12x buffers reused by identically-shaped, sequential MoE layers."""
+
+    static_workspace: Any
+    dynamic_workspace: Any
+    output: torch.Tensor
+
+# vLLM invokes these same-shaped layers sequentially and copies each wrapper's
+# result into caller-owned output before invoking the next layer, so their large
+# graph-safe workspaces and staging output do not need per-layer allocations.
+# A model keeps each entry alive through ``FlashInferB12xExperts._shared_buffers``.
+# Weak values avoid retaining GPU memory after the model is unloaded.  Access is
+# serialized because model construction can prepare layers from multiple threads.
+_B12X_SHARED_BUFFERS: weakref.WeakValueDictionary[
+    tuple[Any, ...], _B12xSharedCudaGraphBuffers
+] = weakref.WeakValueDictionary()
+_B12X_SHARED_BUFFERS_LOCK = threading.Lock()
 
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
@@ -88,6 +111,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
         # Lazily created on first apply() call.
         self._wrapper: Any | None = None
+        self._shared_buffers: _B12xSharedCudaGraphBuffers | None = None
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
 
@@ -239,7 +263,19 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
         from flashinfer.fused_moe import B12xMoEWrapper
 
-        self._wrapper = B12xMoEWrapper(
+        device_index = torch.cuda.current_device()
+        key = (
+            device_index,
+            self.global_num_experts,
+            self.topk,
+            self.hidden_dim,
+            self.intermediate_size_per_partition,
+            self.max_num_tokens,
+            self.num_local_experts,
+            self.out_dtype,
+            self._activation_str,
+        )
+        wrapper_kwargs = dict(
             num_experts=self.global_num_experts,
             top_k=self.topk,
             hidden_size=self.hidden_dim,
@@ -247,8 +283,33 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             use_cuda_graph=True,
             max_num_tokens=self.max_num_tokens,
             num_local_experts=self.num_local_experts,
+            output_dtype=self.out_dtype,
+            device=f"cuda:{device_index}",
             activation=self._activation_str,
         )
+
+        with _B12X_SHARED_BUFFERS_LOCK:
+            shared = _B12X_SHARED_BUFFERS.get(key)
+            if shared is None:
+                wrapper = B12xMoEWrapper(**wrapper_kwargs)
+                shared = _B12xSharedCudaGraphBuffers(
+                    static_workspace=wrapper._static_workspace,
+                    dynamic_workspace=wrapper._dynamic_workspace,
+                    output=wrapper._moe_output,
+                )
+                _B12X_SHARED_BUFFERS[key] = shared
+            else:
+                wrapper = B12xMoEWrapper(
+                    **wrapper_kwargs,
+                    shared_static_workspace=shared.static_workspace,
+                    shared_dynamic_workspace=shared.dynamic_workspace,
+                    shared_output=shared.output,
+                )
+
+            # Keep the weak-cache entry alive exactly as long as at least one
+            # layer using the shared buffers remains alive.
+            self._shared_buffers = shared
+            self._wrapper = wrapper
 
     def apply(
         self,
@@ -285,6 +346,14 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         wrapper = self._wrapper
         assert wrapper is not None
 
+        # With VLLM_MOE_SKIP_PADDING enabled, the router represents padded
+        # token routes as expert id -1 and gives them zero weight.  The B12x
+        # kernels index expert metadata directly and do not accept the -1
+        # sentinel, so map it to an in-range expert while preserving the
+        # router's zero weight.  This is graph-capturable and makes padded
+        # rows contribute exactly zero without an out-of-bounds expert read.
+        safe_topk_ids = topk_ids.to(torch.int32).clamp_min(0)
+
         wrapper_output = wrapper.run(
             x=hidden_states,
             w1_weight=w1,
@@ -294,7 +363,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             w2_weight=w2,
             w2_weight_sf=self.w2_sf_mma,
             w2_alpha=self.g2_alphas,
-            token_selected_experts=topk_ids.to(torch.int32),
+            token_selected_experts=safe_topk_ids,
             token_final_scales=topk_weights,
         )
         output.copy_(wrapper_output)

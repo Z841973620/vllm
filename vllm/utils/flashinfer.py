@@ -293,9 +293,41 @@ flashinfer_cutlass_fused_moe = _lazy_import_wrapper(
 flashinfer_cutedsl_grouped_gemm_nt_masked = _lazy_import_wrapper(
     "flashinfer.cute_dsl.blockscaled_gemm", "grouped_gemm_nt_masked"
 )
-flashinfer_prepare_bf16_fp4_weights = _lazy_import_wrapper(
+_flashinfer_prepare_bf16_fp4_weights = _lazy_import_wrapper(
     "flashinfer.gemm", "prepare_bf16_fp4_weights"
 )
+
+
+def flashinfer_prepare_bf16_fp4_weights(
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: torch.Tensor | None = None,
+    *,
+    backend: str,
+    block_size: int = 16,
+):
+    """Prepare W4A16 weights, including FlashInfer 0.7's SM110 gap.
+
+    FlashInfer 0.7 advertises SM110 for this API, but its public dispatcher
+    only sends SM100/103 to the tcgen05 implementation and otherwise rejects
+    SM110.  The SM100 preparation format is the tcgen05-family format and is
+    also the correct one on Thor.
+    """
+    if (
+        backend == "cute-dsl"
+        and b.is_cuda
+        and torch.cuda.get_device_capability(b.device) == (11, 0)
+    ):
+        from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+            _prepare_cute_dsl_sm100,
+        )
+
+        return _prepare_cute_dsl_sm100(b, b_descale, alpha, block_size)
+    return _flashinfer_prepare_bf16_fp4_weights(
+        b, b_descale, alpha, backend=backend, block_size=block_size
+    )
+
+
 flashinfer_fp4_quantize = _lazy_import_wrapper("flashinfer", "fp4_quantize")
 flashinfer_mxfp4_quantize = _lazy_import_wrapper("flashinfer", "mxfp4_quantize")
 nvfp4_batched_quantize = _lazy_import_wrapper("flashinfer", "nvfp4_batched_quantize")
@@ -376,6 +408,8 @@ def has_flashinfer_packed_fused_kda_decode() -> bool:
 @functools.cache
 def has_flashinfer_nvlink_two_sided() -> bool:
     """Return `True` if FlashInfer mnnvl all2all is available."""
+    if current_platform.is_device_capability(110):
+        return False
     if not has_flashinfer_comm():
         return False
 
@@ -397,6 +431,8 @@ def has_flashinfer_nvlink_two_sided() -> bool:
 @functools.cache
 def has_flashinfer_nvlink_one_sided() -> bool:
     """Return `True` if FlashInfer trtllm_moe_alltoall module is available."""
+    if current_platform.is_device_capability(110):
+        return False
     if not has_flashinfer_comm():
         return False
     return importlib.util.find_spec("flashinfer.comm.trtllm_moe_alltoall") is not None
@@ -517,6 +553,13 @@ def has_flashinfer_fused_kda_decode() -> bool:
 @functools.cache
 def has_flashinfer_trtllm_fused_moe() -> bool:
     """Return `True` if FlashInfer TRTLLM fused MoE is available."""
+    # CUDA 13 reports Thor as SM110. It shares parts of the SM100 source ISA,
+    # but the published TRT-LLM sm100 cubins are not SM110 binaries. Rewriting
+    # their ELF target lets them load, then fails with an illegal instruction
+    # in the batched-GEMM pipeline. Keep every TRT-LLM MoE variant out of the
+    # SM110 oracle and let CuTeDSL/CUTLASS backends handle this device.
+    if current_platform.is_device_capability(110):
+        return False
     if not has_flashinfer_moe():
         return False
     required_functions = [
@@ -654,6 +697,16 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
     """
     # Batch-invariant mode disables TRTLLM attention
     if envs.VLLM_BATCH_INVARIANT:
+        return False
+
+    # Thor is part of the SM100 instruction family for source-compiled
+    # tcgen05 kernels, but FlashInfer's packaged TRTLLM FMHA cubins do not
+    # contain code loadable on Thor (SM101 before CUDA 13, SM110 since
+    # CUDA 13). Use FlashInfer native attention on Thor instead.
+    if (
+        current_platform.is_device_capability(101)
+        or current_platform.is_device_capability(110)
+    ):
         return False
 
     # Requires NVIDIA artifactory to be accessible to download cubins
@@ -889,6 +942,25 @@ if has_flashinfer():
         B_scale: torch.Tensor,
         global_scale: torch.Tensor,
     ) -> torch.Tensor:
+        # FlashInfer 0.7's public dispatcher omits SM110 even though Thor
+        # supports tcgen05.  Use the same implementation as SM100/103; this
+        # has been compiled and numerically validated on native SM110.
+        if torch.cuda.get_device_capability(A.device) == (11, 0):
+            from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+                _compute_cute_dsl_sm100,
+            )
+
+            return _compute_cute_dsl_sm100(
+                A,
+                B,
+                B_scale,
+                global_scale,
+                A.dtype,
+                None,
+                16,
+                True,
+            )
+
         from flashinfer.gemm import mm_bf16_fp4
 
         return mm_bf16_fp4(

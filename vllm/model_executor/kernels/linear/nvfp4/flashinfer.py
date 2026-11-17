@@ -46,10 +46,11 @@ class FlashInferCuteDslNvFp4W4A16LinearKernel(NvFp4LinearKernel):
                 return False, "CUDA compute capability is unavailable"
             compute_capability = capability.to_int()
 
-        if compute_capability not in (100, 103) and not (
-            compute_capability >= 120 and compute_capability < 130
-        ):
-            return False, "FlashInfer CuTe-DSL W4A16 requires sm_100 or sm_12x"
+        if compute_capability not in (100, 103, 110):
+            return (
+                False,
+                "FlashInfer CuTe-DSL W4A16 requires tcgen05 (SM100/103/110)",
+            )
         if not has_flashinfer_bf16_fp4():
             return False, "FlashInfer CuTe-DSL BF16 x FP4 GEMM is unavailable"
         return True, None
@@ -269,6 +270,8 @@ class FlashInferTrtllmNvFp4LinearKernel(NvFp4LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
+        if current_platform.is_device_capability(110):
+            return False, "FlashInfer TRTLLM cubins are disabled on SM110"
         if has_flashinfer():
             return True, None
         return False, "FlashInfer required"
@@ -395,13 +398,22 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        if current_platform.has_device_capability(120) and has_flashinfer_b12x_gemm():
-            return True, None
-        return (
-            False,
-            "FlashInfer b12x requires SM120+ and FlashInfer "
-            "with Sm120BlockScaledDenseGemmKernel",
-        )
+        if compute_capability is None:
+            if not current_platform.is_cuda():
+                return False, "FlashInfer B12x requires CUDA"
+            capability = current_platform.get_device_capability()
+            if capability is None:
+                return False, "CUDA compute capability is unavailable"
+            compute_capability = capability.to_int()
+
+        if not 120 <= compute_capability < 130:
+            return False, "FlashInfer B12x requires an SM12x GPU"
+        if not has_flashinfer_b12x_gemm():
+            return (
+                False,
+                "FlashInfer B12x requires Sm120BlockScaledDenseGemmKernel",
+            )
+        return True, None
 
     @classmethod
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
@@ -424,9 +436,27 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
         output_dtype = x.dtype
         output_shape = [*x.shape[:-1], output_size]
 
+        if self.config.use_a16:
+            # W4A16 checkpoints have no calibrated activation global scale.
+            # Compute one on-device, then dynamically quantize BF16 to NVFP4
+            # so the SM12x MMA still receives FP4 for both operands.
+            amax = x.detach().abs().amax().to(torch.float32)
+            nonzero = amax > 0
+            safe_amax = torch.where(nonzero, amax, torch.ones_like(amax))
+            input_global_scale = torch.where(
+                nonzero,
+                safe_amax / (448.0 * 6.0),
+                torch.ones_like(safe_amax),
+            )
+            input_global_scale_inv = input_global_scale.reciprocal()
+            alpha = input_global_scale * layer.weight_global_scale
+        else:
+            input_global_scale_inv = layer.input_global_scale_inv
+            alpha = layer.alpha
+
         x_fp4, x_blockscale = scaled_fp4_quant(
             x,
-            layer.input_global_scale_inv,
+            input_global_scale_inv,
             is_sf_swizzled_layout=True,
             backend="b12x",
         )
@@ -440,7 +470,7 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
             layer.weight,
             x_blockscale,
             layer.weight_scale,
-            layer.alpha,
+            alpha,
             output_dtype,
             backend="b12x",
         )

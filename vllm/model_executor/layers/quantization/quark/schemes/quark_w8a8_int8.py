@@ -60,8 +60,8 @@ class QuarkW8A8Int8(QuarkScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # turing and up
-        return 75
+        # sm_72 (Xavier) runs via the wmma IMMA kernel; sm_75+ uses CUTLASS.
+        return 72
 
     def create_weights(
         self,
