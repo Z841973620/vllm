@@ -119,6 +119,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         enable_force_include_usage: bool = False,
         enable_per_request_metrics: bool = False,
         enable_log_outputs: bool = False,
+        enable_store: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
@@ -162,7 +163,10 @@ class OpenAIServingResponses(GenerateBaseServing):
         # NOTE(woosuk): This may not be intuitive for users, as the default
         # behavior in OpenAI's Responses API is to store the response, but
         # vLLM's default behavior is not.
-        self.enable_store = envs.VLLM_ENABLE_RESPONSES_API_STORE
+        # Both the 0.31 CLI path (--enable-responses-store passed through the
+        # api_router as enable_store=) and the env path
+        # (VLLM_ENABLE_RESPONSES_API_STORE=1) enable the store; either wins.
+        self.enable_store = bool(enable_store or envs.VLLM_ENABLE_RESPONSES_API_STORE)
         if self.enable_store:
             logger.warning_once(
                 "`VLLM_ENABLE_RESPONSES_API_STORE` is enabled. This may "
