@@ -833,6 +833,21 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         )
 
 
+# The b12x SM12x family. NvFp4MoeBackend has two members for the same
+# kernel family: B12X (explicit --moe-backend b12x, planned-API path in
+# b12x.py) and FLASHINFER_B12X (the functional-wrapper path in
+# flashinfer_b12x_moe.py, first in the auto-selection list on SM120/121
+# and therefore what GB10 actually gets). Both do in-kernel BF16->FP4
+# activation quantization and never read the checkpoint activation
+# scales, so both keep plain zeros and are exempt from the downgrade.
+# Matching a single member silently lets the other one through.
+_B12X_NVFP4_MOE_BACKENDS = frozenset(
+    {
+        NvFp4MoeBackend.B12X,
+        NvFp4MoeBackend.FLASHINFER_B12X,
+    }
+)
+
 # Backends whose NVFP4 MoE implementation really serves weight-only experts
 # (BF16 activations, FP4 weights). Verified per backend:
 #   CUTEDSL  -- prepare_..._cutedsl drops a13/a2 when use_a16, apply() uses
@@ -840,12 +855,15 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 #   MARLIN   -- prepare_..._for_marlin always discards a13/a2
 #   HUMMING  -- _supports_quant_scheme lists (kNvfp4Static, None) and defers
 #               input quantization to the kernel
-#   B12X     -- quantization happens in-kernel (excluded from the downgrade,
-#               listed for completeness)
-# FLASHINFER_CUTEDSL_BATCHED advertises (kNvfp4Static, None) but its
-# constructor asserts quant_dtype == "nvfp4" and it folds the activation
-# scales into the weight scales, so it cannot serve a checkpoint that has
-# none. EMULATION/TRTLLM/CUTLASS do not accept the weight-only key at all.
+#   B12X     -- in-kernel quantization (excluded from the downgrade via
+#               _B12X_NVFP4_MOE_BACKENDS; listed for completeness)
+# FLASHINFER_B12X is deliberately NOT here: although it advertises
+# (kNvfp4Static, None), make_nvfp4_moe_quant_config has no w4a16 branch for
+# it and its conversion runs through the generic fi/cutlass prep, which
+# always folds the activation scales. The guard above keeps it out.
+# FLASHINFER_CUTEDSL_BATCHED advertises the key too but its constructor
+# asserts quant_dtype == "nvfp4" and it folds the scales into the weight
+# scales. EMULATION/TRTLLM/CUTLASS do not accept the key at all.
 _W4A16_NVFP4_MOE_BACKENDS = frozenset(
     {
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
@@ -1018,11 +1036,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # these parameters at whatever create_weights put there. Fill them
         # with NaN so process_weights_after_loading can tell "never loaded"
         # from a genuine static scale -- consuming uninitialised memory there
-        # silently corrupts the activations. b12x ignores the activation
-        # scales, so it keeps plain zeros.
+        # silently corrupts the activations. b12x quantizes activations
+        # in-kernel and never reads these, so it keeps plain zeros.
         missing_scale_sentinel = (
             not self.use_a16
-            and self.nvfp4_backend != NvFp4MoeBackend.B12X
+            and self.nvfp4_backend not in _B12X_NVFP4_MOE_BACKENDS
         )
         if missing_scale_sentinel:
             w13_input_scale_data = torch.full(
@@ -1125,7 +1143,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         if (
             not self.use_a16
             and self.quant_config.moe_activation_override is None
-            and self.nvfp4_backend != NvFp4MoeBackend.B12X
+            and self.nvfp4_backend not in _B12X_NVFP4_MOE_BACKENDS
             and self._activation_scales_missing(layer)
         ):
             self._downgrade_to_w4a16(layer)
